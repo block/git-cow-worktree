@@ -4,9 +4,9 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +23,16 @@ const (
 )
 
 // Options collected from argv after light parsing.
+type cowMode string
+
+const (
+	cowModeLegacy cowMode = "" // preserve the tool's existing behavior
+	cowModeAuto   cowMode = "auto"
+	cowModeOff    cowMode = "off"
+)
+
 type Options struct {
+	CowMode       cowMode
 	Verbose       bool
 	FromSpecified bool
 	FromPath      string   // --from <path>; empty means auto-pick
@@ -38,7 +47,7 @@ type Options struct {
 
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "add" {
-		fmt.Fprintf(os.Stderr, "usage: %s add [-b <new-branch>] [-B <branch>] [--from <path>] [-v] <path> [<commit-ish>]\n", commandName)
+		fmt.Fprintf(os.Stderr, "usage: %s add [--cow=auto|off] [-b <new-branch>] [-B <branch>] [--from <path>] [-v] <path> [<commit-ish>]\n", commandName)
 		os.Exit(2)
 	}
 	if err := run(os.Args[2:]); err != nil {
@@ -47,22 +56,36 @@ func main() {
 	}
 }
 
-func run(args []string) error {
+func run(args []string) (retErr error) {
 	opts, err := parseArgs(args)
 	if err != nil {
 		return err
+	}
+
+	// Explicitly disabled means exactly stock Git, with no registration or
+	// filesystem work performed by this process.
+	if opts.CowMode == cowModeOff {
+		return execGitWorktreeAdd(opts.GitArgs)
 	}
 
 	// --no-checkout and --orphan cannot use our seed-then-checkout flow.
 	if opts.NoCheckout || opts.Orphan {
 		return execGitWorktreeAdd(opts.GitArgs)
 	}
-
 	if opts.TargetPath == "" {
 		return errors.New("missing <path> argument")
 	}
 
 	repoDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	if _, err := resolveRev(repoDir, "HEAD"); err != nil {
+		// Git may infer orphan creation in an unborn repository, which is
+		// incompatible with the optimized --no-checkout staging flow.
+		return execGitWorktreeAdd(opts.GitArgs)
+	}
+	targetAbs, err := osAbs(opts.TargetPath)
 	if err != nil {
 		return err
 	}
@@ -76,11 +99,6 @@ func run(args []string) error {
 		explicitSource = &wt
 	}
 
-	targetAbs, err := osAbs(opts.TargetPath)
-	if err != nil {
-		return err
-	}
-
 	overallStart := time.Now()
 	phase := func(name string, t0 time.Time) {
 		if opts.Verbose {
@@ -88,50 +106,103 @@ func run(args []string) error {
 		}
 	}
 
-	// Step 2: git worktree add --no-checkout [user flags], and, alongside
-	// it, the analysis that feeds seeding. The two are independent: the
-	// analysis reads the object store and the source worktree, and touches
-	// nothing under the new worktree.
-	//
-	// What it does need is the target commit, which Git doesn't settle
-	// until the worktree exists. An explicit <commit-ish> — or HEAD, when
-	// one is omitted — resolves to that commit in all but the DWIM cases
-	// (--guess-remote and friends), so we resolve it ourselves and check
-	// the guess against the real HEAD below, redoing the analysis on the
-	// rare miss.
+	guessRev := cmp.Or(opts.CommitIsh, "HEAD")
+	var a *analysis
+	// Automatic mode is deliberately opt-in. It does all capability checks
+	// before registering the worktree; an unsupported filesystem or an
+	// unusable source therefore takes the exact stock-Git path.
+	if opts.CowMode == cowModeAuto {
+		t := time.Now()
+		sha, err := resolveRev(repoDir, guessRev)
+		if err != nil {
+			return fallbackToStock(opts, fmt.Errorf("resolve target: %w", err))
+		}
+		a = analyze(repoDir, targetAbs, sha, explicitSource, opts.Verbose)
+		if a.Err != nil {
+			return fallbackToStock(opts, fmt.Errorf("analyze: %w", a.Err))
+		}
+		if !a.SrcOK {
+			return fallbackToStock(opts, errors.New("no viable source worktree"))
+		}
+		if err := cowPreflight(a.Src.Path, targetAbs); err != nil {
+			return fallbackToStock(opts, err)
+		}
+		phase("preflight", t)
+	}
+
+	refsBefore, err := localBranchRefs(repoDir)
+	if err != nil {
+		return fmt.Errorf("snapshot branches: %w", err)
+	}
+	targetParent := filepath.Dir(targetAbs)
+	if err := os.MkdirAll(targetParent, 0o777); err != nil {
+		return fmt.Errorf("create target parent: %w", err)
+	}
+	stagingParent, err := os.MkdirTemp(targetParent, ".git-cow-worktree-staging-")
+	if err != nil {
+		return fmt.Errorf("create private staging directory: %w", err)
+	}
+	if err := os.Chmod(stagingParent, 0o700); err != nil {
+		os.RemoveAll(stagingParent)
+		return fmt.Errorf("secure private staging directory: %w", err)
+	}
+	defer os.RemoveAll(stagingParent)
+	// Git's --guess-remote keys off the target basename, so preserve it in
+	// staging rather than using a generic temporary leaf name.
+	stagingAbs := filepath.Join(stagingParent, filepath.Base(targetAbs))
+	txn := worktreeTransaction{repoDir: repoDir, targetAbs: stagingAbs, refsBefore: refsBefore}
+	defer func() {
+		if retErr == nil || !txn.registered {
+			return
+		}
+		if rollbackErr := txn.rollback(); rollbackErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("rollback: %w", rollbackErr))
+		}
+	}()
+
+	// Register without checking out. In legacy mode, overlap source analysis
+	// with Git's metadata work. Auto mode already analyzed synchronously so
+	// it could make its preflight/fallback decision before this point.
 	addArgs := append([]string{"worktree", "add", "--no-checkout"}, opts.Forward...)
 	if opts.UseSeparator {
 		addArgs = append(addArgs, "--")
 	}
-	addArgs = append(addArgs, opts.TargetPath)
+	addArgs = append(addArgs, stagingAbs)
 	if opts.CommitIsh != "" {
 		addArgs = append(addArgs, opts.CommitIsh)
 	}
 	t := time.Now()
-	var addErr error
-	var wg sync.WaitGroup
-	wg.Go(func() { addErr = runGitStreaming(repoDir, addArgs...) })
-
-	guessRev := cmp.Or(opts.CommitIsh, "HEAD")
-	var a *analysis
-	if sha, err := resolveRev(repoDir, guessRev); err == nil {
-		a = analyze(repoDir, targetAbs, sha, explicitSource, opts.Verbose)
+	if a == nil {
+		var addErr error
+		var wg sync.WaitGroup
+		wg.Go(func() { addErr = runGitStreaming(repoDir, addArgs...) })
+		if sha, err := resolveRev(repoDir, guessRev); err == nil {
+			a = analyze(repoDir, stagingAbs, sha, explicitSource, opts.Verbose)
+		}
+		wg.Wait()
+		if addErr != nil {
+			return fmt.Errorf("git worktree add: %w", addErr)
+		}
+	} else if err := runGitStreaming(repoDir, addArgs...); err != nil {
+		return fmt.Errorf("git worktree add: %w", err)
 	}
-
-	wg.Wait()
-	if addErr != nil {
-		return fmt.Errorf("git worktree add: %w", addErr)
-	}
+	txn.registered = true
 	phase("worktree add", t)
 
-	// Resolve target SHA from inside the new worktree (HEAD is now set).
-	targetSHA, err := resolveRev(targetAbs, "HEAD")
+	// Resolve the actual target and remember the ref state this transaction
+	// produced, so rollback can use compare-and-swap rather than overwriting
+	// somebody else's concurrent branch update.
+	targetSHA, err := resolveRev(stagingAbs, "HEAD")
 	if err != nil {
 		return err
 	}
+	txn.captureCreatedRef(targetSHA)
+	if os.Getenv("GIT_COW_WORKTREE_FAIL_AFTER_ADD") != "" {
+		return errors.New("injected failure after worktree registration")
+	}
 	if a == nil || a.SHA != targetSHA {
 		t = time.Now()
-		a = analyze(repoDir, targetAbs, targetSHA, explicitSource, opts.Verbose)
+		a = analyze(repoDir, stagingAbs, targetSHA, explicitSource, opts.Verbose)
 		phase("analyze", t)
 	}
 
@@ -140,46 +211,66 @@ func run(args []string) error {
 		if opts.Verbose {
 			fmt.Fprintf(os.Stderr, "%s: source=%s (diff=%d commits)\n", commandName, a.Src.Path, a.Score)
 		}
-		var err error
-		seededIndex, err = seed(a, targetAbs, phase, opts.Verbose)
-		if err != nil {
-			// Seeding is an optimization: anything that goes wrong here
-			// leaves the working tree to the checkout below.
-			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "%s: seeding skipped: %v\n", commandName, err)
-			}
+		seededIndex, err = seed(a, stagingAbs, phase, opts.Verbose)
+		if err != nil && opts.Verbose {
+			fmt.Fprintf(os.Stderr, "%s: seeding skipped: %v\n", commandName, err)
 		}
 	} else if opts.Verbose {
 		fmt.Fprintf(os.Stderr, "%s: no viable source worktree; using plain checkout\n", commandName)
 	}
 
-	// Step 6: finalize.
+	// Checkout and hook are separate phases. A seeded-index failure may be
+	// retried, but a hook failure is returned exactly once and never causes a
+	// second checkout/hook invocation.
 	t = time.Now()
-	if err := finalizeCheckout(targetAbs, targetSHA); err != nil {
+	if err := checkout(stagingAbs); err != nil {
 		if seededIndex == "" {
 			return err
 		}
-		// The index we wrote is the only thing here Git didn't produce
-		// itself. Discard it and let Git check the worktree out from
-		// scratch rather than leaving the user a half-populated one.
-		// A checkout that died mid-flight leaves its lock behind; in a
-		// worktree this new, nobody else can own it.
 		fmt.Fprintf(os.Stderr, "%s: checkout failed against seeded index (%v); retrying from scratch\n", commandName, err)
-		for _, path := range []string{seededIndex, seededIndex + ".lock"} {
-			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
-				return err
-			}
+		// The index is ours. index.lock is not: it may have been created by
+		// Git or another process, so never unlink it here.
+		if rmErr := os.Remove(seededIndex); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return errors.Join(err, fmt.Errorf("remove seeded index: %w", rmErr))
 		}
-		if err := finalizeCheckout(targetAbs, targetSHA); err != nil {
+		if err := checkout(stagingAbs); err != nil {
 			return err
 		}
 	}
 	phase("checkout", t)
 
+	t = time.Now()
+	if err := validateWorktree(stagingAbs, targetSHA); err != nil {
+		return fmt.Errorf("validate staged worktree: %w", err)
+	}
+	phase("correctness validation", t)
+
+	if err := moveWorktree(repoDir, stagingAbs, targetAbs); err != nil {
+		return fmt.Errorf("publish worktree: %w", err)
+	}
+	txn.targetAbs = targetAbs
+
+	// Publication is the transactional boundary. Hooks run in the final path
+	// exactly once; after hook execution starts, preserve the worktree even if
+	// the hook fails, matching native Git's retained-worktree semantics.
+	txn.committed = true
+	t = time.Now()
+	if err := runPostCheckoutHook(targetAbs, targetSHA); err != nil {
+		return err
+	}
+	phase("post-checkout hook", t)
+
 	if opts.Verbose {
 		fmt.Fprintf(os.Stderr, "%s: %-20s %v\n", commandName, "total", time.Since(overallStart).Round(time.Millisecond))
 	}
 	return nil
+}
+
+func fallbackToStock(opts Options, reason error) error {
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "%s: CoW preflight unavailable (%v); using stock git worktree add\n", commandName, reason)
+	}
+	return execGitWorktreeAdd(opts.GitArgs)
 }
 
 // analysis is everything the clone plan needs that depends only on the
@@ -309,14 +400,25 @@ func seed(a *analysis, targetAbs string, phase func(string, time.Time), verbose 
 			return "", err
 		}
 	}
-	phase("sparse check", t)
+	conversion, err := conversionExclusions(a.Src.Path, a.SHA, targetTree)
+	if err != nil {
+		return "", err
+	}
+	excluded := make(map[string]bool, len(a.Excluded)+len(conversion))
+	for path := range a.Excluded {
+		excluded[path] = true
+	}
+	for path := range conversion {
+		excluded[path] = true
+	}
+	phase("sparse and attributes", t)
 
 	// GIT_COW_WORKTREE_NO_DIR_CLONE exercises the file-by-file path, which
 	// is what Linux always takes, on a filesystem that can clone directories.
 	cloneDirs := canCloneDirs && !sparse && os.Getenv("GIT_COW_WORKTREE_NO_DIR_CLONE") == ""
 
 	t = time.Now()
-	plan := planClones(a.SrcTree, targetTree, a.Excluded, cloneDirs)
+	plan := planClones(a.SrcTree, targetTree, excluded, cloneDirs)
 	phase("plan", t)
 
 	t = time.Now()
@@ -397,6 +499,18 @@ func parseArgs(args []string) (Options, error) {
 		case a == "-v" || a == "--verbose":
 			o.Verbose = true
 			// Not forwarded to git: `git worktree add` doesn't accept -v.
+		case a == "--cow":
+			if i+1 >= len(args) {
+				return o, errors.New("--cow requires auto or off")
+			}
+			i++
+			if err := setCowMode(&o, args[i]); err != nil {
+				return o, err
+			}
+		case strings.HasPrefix(a, "--cow="):
+			if err := setCowMode(&o, strings.TrimPrefix(a, "--cow=")); err != nil {
+				return o, err
+			}
 		case a == "--from":
 			if i+1 >= len(args) {
 				return o, errors.New("--from requires a path")
@@ -450,6 +564,16 @@ func parseArgs(args []string) (Options, error) {
 		return o, fmt.Errorf("unexpected positional argument: %s", positional[2])
 	}
 	return o, nil
+}
+
+func setCowMode(o *Options, value string) error {
+	switch cowMode(value) {
+	case cowModeAuto, cowModeOff:
+		o.CowMode = cowMode(value)
+		return nil
+	default:
+		return fmt.Errorf("invalid --cow value %q (want auto or off)", value)
+	}
 }
 
 func gitWorktreeAddFlagArity(arg string) int {

@@ -19,7 +19,7 @@ Git can dispatch `git cow-worktree ...` when the installed `git-cow-worktree` bi
 ## Usage
 
 ```sh
-git cow-worktree add [git-worktree-add flags] [--from <path>] [-v] <path> [<commit-ish>]
+git cow-worktree add [git-worktree-add flags] [--cow=auto|off] [--from <path>] [-v] <path> [<commit-ish>]
 ```
 
 Examples:
@@ -34,6 +34,8 @@ Most flags are inherited from `git worktree add`.
 
 Added by `git-cow-worktree`:
 
+- `--cow=auto`: preflight the source/target pair and use CoW only when supported; otherwise invoke stock `git worktree add`. This mode is explicit and is not yet the default.
+- `--cow=off`: invoke stock `git worktree add` directly.
 - `--from <path>`: use a specific source worktree instead of auto-selecting one.
 - `-v`, `--verbose`: print the chosen source, clone counts, and timings.
 
@@ -60,3 +62,11 @@ It runs `git ls-tree -r -t` on the source and target commits and plans the cheap
 Every cloned file is then hashed and compared against the blob it is supposed to be, and the ones that check out are written to the new worktree's index with their stat data. This is the step that preserves the sharing: Git decides whether to rewrite a working-tree file by comparing it against its index entry, and a worktree with no index — which is what `--no-checkout` leaves behind — makes checkout rewrite every file, undoing every clone. Hashing in parallel is also substantially cheaper than letting Git refresh the index itself, which is single-threaded and uses a collision-detecting SHA-1.
 
 Finally it runs Git checkout in the new worktree. That fills in files that were not cloned, overwrites anything stale, and produces the same index a plain checkout would. Every step before it is best-effort: if reflinks are unsupported, if the source can't be inspected, or if the index can't be written, the checkout still runs and just becomes a normal one.
+
+## Canary safety boundaries
+
+The optimized path creates the worktree in a private staging directory, disables hooks while populating it, validates the requested `HEAD` and clean status, then publishes it with `git worktree move`. The `post-checkout` hook runs once at the final path. A hook failure is returned without rolling back the published worktree, matching native Git behavior.
+
+Paths with filters, working-tree encoding, ident, or text/EOL conversion attributes are excluded from CoW seeding and are populated by Git. Submodule paths are likewise never cloned from a source worktree. Handled failures before publication remove transaction-owned worktree metadata and compare-and-swap-delete only branches created by the operation.
+
+Crash recovery and telemetry orchestration belong to the embedding canary wrapper. This binary provides structured phase boundaries in code but does not upload telemetry.

@@ -22,6 +22,10 @@ type indexEntry struct {
 	Stat fileStat
 }
 
+// Test-only synchronization seam for deterministic source-race coverage.
+// Production never assigns it.
+var testBeforeValidate func()
+
 // validateClones hashes every file the plan claims to have cloned and
 // returns index entries for those that really do hold the target blob.
 //
@@ -34,6 +38,9 @@ type indexEntry struct {
 // that was dirty in a way its stat cache hadn't noticed, a clone that raced
 // with a writer — is simply left out, and the final checkout rewrites it.
 func validateClones(root string, tgt *treeIndex, plan clonePlan) []indexEntry {
+	if hook := testBeforeValidate; hook != nil {
+		hook()
+	}
 	cloned := plan.coverage()
 	var candidates []string
 	for path, te := range tgt.Blobs {
