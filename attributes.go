@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 )
 
@@ -31,12 +32,11 @@ func conversionExclusions(repoDir, targetSHA string, tree *treeIndex) (map[strin
 	args := []string{"check-attr", "-z", "--source=" + targetSHA, "--all", "--stdin"}
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoDir
+	paths := sortedRegularPaths(tree)
 	var input bytes.Buffer
-	for path, entry := range tree.Blobs {
-		if entry.IsRegular() {
-			input.WriteString(path)
-			input.WriteByte(0)
-		}
+	for _, path := range paths {
+		input.WriteString(path)
+		input.WriteByte(0)
 	}
 	cmd.Stdin = &input
 	var stderr bytes.Buffer
@@ -48,11 +48,30 @@ func conversionExclusions(repoDir, targetSHA string, tree *treeIndex) (map[strin
 	fields := bytes.Split(out, []byte{0})
 	excluded := make(map[string]bool)
 	for i := 0; i+2 < len(fields); i += 3 {
-		if conversionAttributes[string(fields[i+1])] && string(fields[i+2]) != "unspecified" {
+		if conversionAttributes[string(fields[i+1])] {
+			// Git renders both !attr and the literal value "unspecified"
+			// as "unspecified". Exclude both rather than treating an active
+			// filter with that legal name as conversion-free.
 			excluded[string(fields[i])] = true
 		}
 	}
 	return excluded, nil
+}
+
+func sortedRegularPaths(tree *treeIndex) []string {
+	paths := make([]string, 0, len(tree.Blobs))
+	for path, entry := range tree.Blobs {
+		if entry.IsRegular() {
+			paths = append(paths, path)
+		}
+	}
+	// Git incrementally maintains an attribute stack as it consumes paths.
+	// Keeping sibling paths adjacent lets it reuse the common directory
+	// prefix instead of repeatedly tearing down and rebuilding that stack.
+	// tree.Blobs is a map, so its iteration order would otherwise make this
+	// phase dramatically slower and its timing nondeterministic.
+	sort.Strings(paths)
+	return paths
 }
 
 func conversionConfigEnabled(repoDir string) bool {

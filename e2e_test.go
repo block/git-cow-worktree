@@ -47,6 +47,37 @@ func TestParseArgsCowMode(t *testing.T) {
 	}
 }
 
+func TestSortedRegularPaths(t *testing.T) {
+	tree := &treeIndex{Blobs: map[string]TreeEntry{
+		"z.txt":        {Mode: "100644"},
+		"dir/b.txt":    {Mode: "100755"},
+		"dir/a.txt":    {Mode: "100644"},
+		"dir/link.txt": {Mode: "120000"},
+	}}
+	got := sortedRegularPaths(tree)
+	want := []string{"dir/a.txt", "dir/b.txt", "z.txt"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("sortedRegularPaths=%q want %q", got, want)
+	}
+}
+
+func TestConversionExclusionsTreatsLiteralUnspecifiedAsActive(t *testing.T) {
+	r := newRepo(t, "literal-unspecified")
+	r.commit("asset.txt", "raw:value\n")
+	r.commit(".gitattributes", "asset.txt filter=unspecified\n")
+	tree, err := lsTree(r.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	excluded, err := conversionExclusions(r.dir, gitOutput(t, r.dir, "rev-parse", "HEAD"), tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !excluded["asset.txt"] {
+		t.Fatal("active filter whose value is rendered as unspecified was not excluded")
+	}
+}
+
 func TestE2E_CowOffUsesStockGit(t *testing.T) {
 	bin := buildGitCowWorktree(t)
 	r := newRepo(t, "off")

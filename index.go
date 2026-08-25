@@ -85,9 +85,10 @@ func writeIndex(path string, entries []indexEntry) error {
 	buf.Write(sum.Sum(nil))
 
 	if os.Getenv("GIT_COW_WORKTREE_CORRUPT_INDEX") != "" {
-		// Test hook: an index Git will refuse, to exercise the recovery
-		// path in run(). Nothing else claims an entry count this absurd.
-		binary.BigEndian.PutUint32(buf.Bytes()[8:], 0x7fffffff)
+		// Test hook: an index Git will refuse cleanly, to exercise the recovery
+		// path in run(). A bad signature avoids inducing a child crash that can
+		// strand Git's own index.lock and obscure the retry behavior under test.
+		buf.Bytes()[0] = 'X'
 	}
 
 	// Write through index.lock, as Git does, so a concurrent Git process

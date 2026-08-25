@@ -17,13 +17,6 @@ import (
 // writes only what's left; if seeding didn't happen, or the index we wrote
 // was rejected, this degrades to an ordinary full checkout.
 func checkout(repoDir string) error {
-	index, err := indexPath(repoDir)
-	if err != nil {
-		return err
-	}
-	lock := index + ".lock"
-	_, statErr := os.Lstat(lock)
-	lockAbsent := errors.Is(statErr, os.ErrNotExist)
 	cmd := exec.Command("git",
 		"-c", "checkout.workers=0",
 		"-c", "core.hooksPath=/dev/null",
@@ -33,11 +26,9 @@ func checkout(repoDir string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		// Git owns any lock it creates during this child invocation. Remove
-		// only that lock, and only if no lock existed before the child started.
-		if lockAbsent {
-			_ = os.Remove(lock)
-		}
+		// Git owns and cleans up locks created by this child. Never infer lock
+		// ownership from an earlier absence: another process may have created
+		// the linked-worktree index.lock after such a check.
 		return fmt.Errorf("git checkout: %w", err)
 	}
 	return nil
