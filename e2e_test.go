@@ -20,6 +20,321 @@ import (
 // `git worktree add` against equivalent setups, the resulting worktrees'
 // tracked-file contents are byte-identical.
 
+func TestParseArgsCowMode(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want cowMode
+	}{
+		{[]string{"--cow=auto", "out", "target"}, cowModeAuto},
+		{[]string{"--cow", "off", "out", "target"}, cowModeOff},
+		{[]string{"--cow=auto", "--cow=off", "out", "target"}, cowModeOff},
+	} {
+		o, err := parseArgs(tc.args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.CowMode != tc.want {
+			t.Errorf("parseArgs(%v) mode=%q want %q", tc.args, o.CowMode, tc.want)
+		}
+		for _, a := range append(append([]string{}, o.Forward...), o.GitArgs...) {
+			if strings.HasPrefix(a, "--cow") {
+				t.Errorf("tool flag leaked to Git: %q", a)
+			}
+		}
+	}
+	if _, err := parseArgs([]string{"--cow=required", "out"}); err == nil {
+		t.Error("invalid mode succeeded")
+	}
+}
+
+func TestSortedRegularPaths(t *testing.T) {
+	tree := &treeIndex{Blobs: map[string]TreeEntry{
+		"z.txt":        {Mode: "100644"},
+		"dir/b.txt":    {Mode: "100755"},
+		"dir/a.txt":    {Mode: "100644"},
+		"dir/link.txt": {Mode: "120000"},
+	}}
+	got := sortedRegularPaths(tree)
+	want := []string{"dir/a.txt", "dir/b.txt", "z.txt"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("sortedRegularPaths=%q want %q", got, want)
+	}
+}
+
+func TestConversionExclusionsTreatsLiteralUnspecifiedAsActive(t *testing.T) {
+	r := newRepo(t, "literal-unspecified")
+	r.commit("asset.txt", "raw:value\n")
+	r.commit(".gitattributes", "asset.txt filter=unspecified\n")
+	tree, err := lsTree(r.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	excluded, err := conversionExclusions(r.dir, gitOutput(t, r.dir, "rev-parse", "HEAD"), tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !excluded["asset.txt"] {
+		t.Fatal("active filter whose value is rendered as unspecified was not excluded")
+	}
+}
+
+func TestE2E_CowOffUsesStockGit(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "off")
+	r.commit("a.txt", "alpha")
+	r.branch("target", "HEAD")
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "--cow=off", "--from", filepath.Join(r.parent, "does-not-exist"), "-v", "--detach", out, "target")
+	cmd.Dir = r.dir
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("--cow=off: %v\n%s", err, got)
+	}
+	assertIndexUpToDate(t, out, "")
+}
+
+func TestE2E_CowAutoPreflightFallbackUsesStockGit(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "auto-fallback")
+	r.commit("a.txt", "alpha")
+	r.branch("target", "HEAD")
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "--cow=auto", "-v", "--detach", out, "target")
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "GIT_COW_WORKTREE_FORCE_NO_COW=1")
+	got, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--cow=auto fallback: %v\n%s", err, got)
+	}
+	if !strings.Contains(string(got), "using stock git worktree add") {
+		t.Fatalf("fallback not reported:\n%s", got)
+	}
+	assertIndexUpToDate(t, out, "")
+}
+
+func TestE2E_HandledFailureRollsBack(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "rollback")
+	r.commit("a.txt", "alpha")
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "-b", "new-topic", out, "HEAD")
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "GIT_COW_WORKTREE_FAIL_AFTER_ADD=1")
+	if got, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("injected failure succeeded:\n%s", got)
+	}
+	if _, err := os.Stat(out); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("target residue: %v", err)
+	}
+	if out := gitOutput(t, r.dir, "branch", "--list", "new-topic"); out != "" {
+		t.Fatalf("branch residue: %q", out)
+	}
+	if out := gitOutput(t, r.dir, "worktree", "list", "--porcelain"); strings.Contains(out, "git-cow-worktree-staging") {
+		t.Fatalf("registration residue:\n%s", out)
+	}
+}
+
+func TestE2E_HandledFailureRestoresResetBranch(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "rollback-reset")
+	r.commit("a.txt", "one")
+	r.branch("topic", "HEAD")
+	old := gitOutput(t, r.dir, "rev-parse", "topic")
+	r.commit("a.txt", "two")
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "-B", "topic", out, "HEAD")
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "GIT_COW_WORKTREE_FAIL_AFTER_ADD=1")
+	if got, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("injected failure succeeded:\n%s", got)
+	}
+	if got := gitOutput(t, r.dir, "rev-parse", "topic"); got != old {
+		t.Fatalf("topic=%s want restored %s", got, old)
+	}
+}
+
+func TestE2E_HandledFailureRollsBackLockedWorktree(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "rollback-locked")
+	r.commit("a.txt", "alpha")
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "--lock", "-b", "locked-topic", out, "HEAD")
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "GIT_COW_WORKTREE_FAIL_AFTER_ADD=1")
+	if got, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("injected failure succeeded:\n%s", got)
+	}
+	if out := gitOutput(t, r.dir, "worktree", "list", "--porcelain"); strings.Contains(out, "git-cow-worktree-staging") {
+		t.Fatalf("registration residue:\n%s", out)
+	}
+	if out := gitOutput(t, r.dir, "branch", "--list", "locked-topic"); out != "" {
+		t.Fatalf("branch residue: %q", out)
+	}
+}
+
+func TestE2E_ExistingEmptyTargetUsesExactPath(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "empty-target")
+	r.commit("a.txt", "alpha")
+	r.branch("target", "HEAD")
+	out := filepath.Join(r.parent, "out")
+	if err := os.Mkdir(out, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "add", "--detach", out, "target")
+	cmd.Dir = r.dir
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("add: %v\n%s", err, got)
+	}
+	if _, err := os.Stat(filepath.Join(out, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "out")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("nested destination exists: %v", err)
+	}
+}
+
+func TestE2E_AutoCRLFMatchesStock(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "autocrlf")
+	r.commit("a.txt", "a\nb\n")
+	r.branch("target", "HEAD")
+	r.worktree("src", "target")
+	r.run("git", "config", "core.autocrlf", "true")
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "--from", filepath.Join(r.parent, "src"), "--detach", out, "target")
+	cmd.Dir = r.dir
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("add: %v\n%s", err, got)
+	}
+	got, err := os.ReadFile(filepath.Join(out, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "a\r\nb\r\n" {
+		t.Fatalf("content=%q", got)
+	}
+}
+
+func TestE2E_UnbornRepositoryUsesStockGit(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "unborn")
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", out)
+	cmd.Dir = r.dir
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("unborn add: %v\n%s", err, got)
+	}
+	if _, err := os.Stat(filepath.Join(out, ".git")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestE2E_PostCheckoutFailureRunsOnceAndRetains(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "hook-fail")
+	r.commit("a.txt", "alpha")
+	r.branch("target", "HEAD")
+	r.worktree("src", "target")
+	hooks := filepath.Join(r.parent, "hooks")
+	if err := os.Mkdir(hooks, 0755); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(r.parent, "hook.log")
+	hook := "#!/bin/sh\necho once >> " + shellQuote(log) + "\nexit 7\n"
+	if err := os.WriteFile(filepath.Join(hooks, "post-checkout"), []byte(hook), 0755); err != nil {
+		t.Fatal(err)
+	}
+	r.run("git", "config", "core.hooksPath", hooks)
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "--from", filepath.Join(r.parent, "src"), "--detach", out, "target")
+	cmd.Dir = r.dir
+	if got, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("hook failure succeeded:\n%s", got)
+	}
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "once\n" {
+		t.Fatalf("hook log=%q", got)
+	}
+	if _, err := os.Stat(filepath.Join(out, "a.txt")); err != nil {
+		t.Fatalf("published worktree not retained: %v", err)
+	}
+}
+
+func TestE2E_FilteredCanonicalSourceIsSmudgedByTarget(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "filter")
+	filter := filepath.Join(r.parent, "filter.sh")
+	script := "#!/bin/sh\nif [ \"$1\" = smudge ]; then sed 's/^raw:/smudged:/'; else sed 's/^smudged:/raw:/'; fi\n"
+	if err := os.WriteFile(filter, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	r.run("git", "config", "filter.demo.clean", filter+" clean")
+	r.run("git", "config", "filter.demo.smudge", filter+" smudge")
+	r.run("git", "config", "filter.demo.required", "true")
+	r.commit("asset.txt", "raw:value\n")
+	r.commit(".gitattributes", "asset.txt filter=demo\n")
+	r.branch("target", "HEAD")
+	r.worktree("src", "target")
+	// Simulate a skip-smudge/LFS-pointer source: canonical blob bytes are
+	// clean according to Git but must not suppress target smudge processing.
+	if err := os.WriteFile(filepath.Join(r.parent, "src", "asset.txt"), []byte("raw:value\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(bin, "add", "--from", filepath.Join(r.parent, "src"), "--detach", out, "target")
+	cmd.Dir = r.dir
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("filtered add: %v\n%s", err, got)
+	}
+	got, err := os.ReadFile(filepath.Join(out, "asset.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "smudged:value\n" {
+		t.Fatalf("filtered content=%q", got)
+	}
+	assertIndexUpToDate(t, out, "")
+}
+
+func TestPlanClonesSubmoduleTaintsAncestor(t *testing.T) {
+	entry := TreeEntry{Mode: "100644", SHA: strings.Repeat("a", 40)}
+	src := &treeIndex{Blobs: map[string]TreeEntry{"vendor/sibling.txt": entry}, Trees: map[string]string{"vendor": "tree"}, Gitlinks: map[string]string{"vendor/module": "sub"}}
+	tgt := &treeIndex{Blobs: map[string]TreeEntry{"vendor/sibling.txt": entry}, Trees: map[string]string{"vendor": "tree"}, Gitlinks: map[string]string{"vendor/module": "sub"}}
+	p := planClones(src, tgt, nil, true)
+	for _, d := range p.Dirs {
+		if d == "vendor" {
+			t.Fatal("submodule ancestor cloned whole")
+		}
+	}
+	if len(p.Files) != 1 || p.Files[0] != "vendor/sibling.txt" {
+		t.Fatalf("files=%v", p.Files)
+	}
+}
+
+func TestValidateClonesRejectsMutationAfterClone(t *testing.T) {
+	root := t.TempDir()
+	path := "race.txt"
+	if err := os.WriteFile(filepath.Join(root, path), []byte("committed"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Blob ID for the original committed bytes.
+	cmd := exec.Command("git", "hash-object", filepath.Join(root, path))
+	oid, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := &treeIndex{Blobs: map[string]TreeEntry{path: {Mode: "100644", SHA: strings.TrimSpace(string(oid))}}}
+	plan := clonePlan{Files: []string{path}}
+	testBeforeValidate = func() { _ = os.WriteFile(filepath.Join(root, path), []byte("source-local"), 0644) }
+	defer func() { testBeforeValidate = nil }()
+	if entries := validateClones(root, tree, plan); len(entries) != 0 {
+		t.Fatalf("validated raced content: %+v", entries)
+	}
+}
+
 func TestE2E_DropInInvariant(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -784,7 +1099,12 @@ func TestE2E_PostCheckoutHookArgs(t *testing.T) {
 	r.worktree("src", "target")
 
 	hookLog := filepath.Join(r.parent, "hook.log")
-	hookPath := filepath.Join(r.dir, ".git", "hooks", "post-checkout")
+	hooks := filepath.Join(r.parent, "hooks-sha1")
+	if err := os.Mkdir(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r.run("git", "config", "core.hooksPath", hooks)
+	hookPath := filepath.Join(hooks, "post-checkout")
 	hook := "#!/bin/sh\n" +
 		"printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> " + shellQuote(hookLog) + "\n"
 	if err := os.WriteFile(hookPath, []byte(hook), 0o755); err != nil {
@@ -833,7 +1153,12 @@ func TestE2E_PostCheckoutHookArgsSHA256(t *testing.T) {
 	r.worktree("src", "target")
 
 	hookLog := filepath.Join(r.parent, "hook.log")
-	hookPath := filepath.Join(r.dir, ".git", "hooks", "post-checkout")
+	hooks := filepath.Join(r.parent, "hooks-sha256")
+	if err := os.Mkdir(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r.run("git", "config", "core.hooksPath", hooks)
+	hookPath := filepath.Join(hooks, "post-checkout")
 	hook := "#!/bin/sh\n" +
 		"printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> " + shellQuote(hookLog) + "\n"
 	if err := os.WriteFile(hookPath, []byte(hook), 0o755); err != nil {
