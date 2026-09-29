@@ -18,6 +18,19 @@ Git can dispatch `git cow-worktree ...` when the installed `git-cow-worktree` bi
 
 ## Usage
 
+Install the beta pack, then use the `sq` entry point:
+
+```sh
+sq packs add git-cow-worktree
+sq git-cow-worktree add [git-worktree-add flags] [--from <path>] [-v] <path> [<commit-ish>]
+```
+
+Each distinct repository, target path, and argument set is assigned deterministically to the stock or CoW arm with 50:50 probability. Retrying the same operation stays in the same arm. `sq` records the command's standard telemetry, including total duration, exit status, and command arguments, plus bounded `arm:stock|cow`, `backend:stock|cow|unknown`, and `result:success|failure` labels. Paths and branch names are never included in custom labels, but may be present in `sq`'s standard argument telemetry.
+
+Installing the companion `git-cow-worktree-beta` agent skill opts an agent into creating worktrees through this command. Remove the skill to opt out of agent-driven beta use.
+
+The public binary remains usable directly as a drop-in Git command; direct invocations retain its existing behavior and do not join or report the experiment:
+
 ```sh
 git cow-worktree add [git-worktree-add flags] [--cow=auto|off] [--from <path>] [-v] <path> [<commit-ish>]
 ```

@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 )
+
+var backendLabelWritten bool
 
 const (
 	commandName        = "git-cow-worktree"
@@ -46,14 +49,141 @@ type Options struct {
 }
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "add" {
-		fmt.Fprintf(os.Stderr, "usage: %s add [--cow=auto|off] [-b <new-branch>] [-B <branch>] [--from <path>] [-v] <path> [<commit-ish>]\n", commandName)
+	if len(os.Args) < 2 {
+		printUsage(os.Stderr)
 		os.Exit(2)
 	}
-	if err := run(os.Args[2:]); err != nil {
-		fmt.Fprintln(os.Stderr, commandName+":", err)
-		os.Exit(1)
+	switch os.Args[1] {
+	case "--summary":
+		fmt.Println("Create a Git worktree using stock or copy-on-write checkout")
+		return
+	case "-h", "--help", "help":
+		printUsage(os.Stdout)
+		return
+	case "add":
+	default:
+		printUsage(os.Stderr)
+		os.Exit(2)
 	}
+
+	participating := os.Getenv("SQ_INVOKED_BY_SQ") != ""
+	mode := cowModeLegacy
+	if participating {
+		opts, err := parseArgs(os.Args[2:])
+		if err != nil {
+			exitWithError(err, true)
+		}
+		if opts.CowMode != cowModeLegacy {
+			exitWithError(errors.New("--cow is controlled by the beta experiment"), true)
+		}
+		mode, err = assignedCowMode(os.Args[2:])
+		if err != nil {
+			exitWithError(err, true)
+		}
+		writeMetricsLabels("arm:" + experimentArm(mode))
+	}
+	if err := runWithMode(os.Args[2:], mode); err != nil {
+		exitWithError(err, participating)
+	}
+	if participating {
+		writeMetricsLabels("result:success")
+	}
+}
+
+func exitWithError(err error, participating bool) {
+	fmt.Fprintln(os.Stderr, commandName+":", err)
+	if participating {
+		if !backendLabelWritten {
+			writeMetricsLabels("backend:unknown")
+		}
+		writeMetricsLabels("result:failure")
+	}
+	os.Exit(1)
+}
+
+func printUsage(w *os.File) {
+	fmt.Fprintln(w, `USAGE
+   sq git-cow-worktree add [git-worktree-add options] <path> [<commit-ish>]
+   git cow-worktree add [git-worktree-add options] <path> [<commit-ish>]
+
+DESCRIPTION
+   Create a Git worktree using the beta's stable 50:50 stock/CoW assignment.
+   Repeating the same repository, target path, and arguments keeps the same arm.
+
+OPTIONS
+   --from <path>   Select a source worktree for the CoW arm
+   -v, --verbose   Show backend, source, clone counts, and timings
+
+SUPPORT
+   https://github.com/josharian/git-cow-worktree`)
+}
+
+func runWithMode(args []string, mode cowMode) error {
+	if mode != cowModeLegacy {
+		args = append([]string{"--cow=" + string(mode)}, args...)
+	}
+	opts, err := parseArgs(args)
+	if err != nil {
+		return err
+	}
+	if mode != cowModeLegacy && opts.Verbose {
+		fmt.Fprintf(os.Stderr, "%s: experiment backend=%s\n", commandName, mode)
+	}
+	return run(args)
+}
+
+func assignedCowMode(args []string) (cowMode, error) {
+	repoDir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return assignedCowModeInDir(args, repoDir)
+}
+
+func assignedCowModeInDir(args []string, repoDir string) (cowMode, error) {
+	opts, err := parseArgs(args)
+	if err != nil {
+		return "", err
+	}
+	if opts.TargetPath == "" {
+		return "", errors.New("missing <path> argument")
+	}
+	commonDir := repoDir
+	cmd := exec.Command("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+	cmd.Dir = repoDir
+	if out, gitErr := cmd.Output(); gitErr == nil {
+		commonDir = strings.TrimSpace(string(out))
+	}
+	targetAbs, err := osAbs(opts.TargetPath)
+	if err != nil {
+		return "", err
+	}
+	key := strings.Join([]string{commonDir, targetAbs, strings.Join(opts.GitArgs, "\x00")}, "\x00")
+	sum := sha256.Sum256([]byte(key))
+	if sum[0]&1 == 0 {
+		return cowModeAuto, nil
+	}
+	return cowModeOff, nil
+}
+
+func experimentArm(mode cowMode) string {
+	if mode == cowModeOff {
+		return "stock"
+	}
+	return "cow"
+}
+
+func writeMetricsLabels(labels ...string) {
+	path := os.Getenv("SQ_METRICS_PIPE")
+	if path == "" || len(labels) == 0 {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "LABELS %s\n", strings.Join(labels, " "))
 }
 
 func run(args []string) (retErr error) {
@@ -65,11 +195,13 @@ func run(args []string) (retErr error) {
 	// Explicitly disabled means exactly stock Git, with no registration or
 	// filesystem work performed by this process.
 	if opts.CowMode == cowModeOff {
+		writeBackendLabel("stock")
 		return execGitWorktreeAdd(opts.GitArgs)
 	}
 
 	// --no-checkout and --orphan cannot use our seed-then-checkout flow.
 	if opts.NoCheckout || opts.Orphan {
+		writeBackendLabel("stock")
 		return execGitWorktreeAdd(opts.GitArgs)
 	}
 	if opts.TargetPath == "" {
@@ -83,6 +215,7 @@ func run(args []string) (retErr error) {
 	if _, err := resolveRev(repoDir, "HEAD"); err != nil {
 		// Git may infer orphan creation in an unborn repository, which is
 		// incompatible with the optimized --no-checkout staging flow.
+		writeBackendLabel("stock")
 		return execGitWorktreeAdd(opts.GitArgs)
 	}
 	targetAbs, err := osAbs(opts.TargetPath)
@@ -129,6 +262,7 @@ func run(args []string) (retErr error) {
 		}
 		phase("preflight", t)
 	}
+	writeBackendLabel("cow")
 
 	refsBefore, err := localBranchRefs(repoDir)
 	if err != nil {
@@ -270,7 +404,16 @@ func fallbackToStock(opts Options, reason error) error {
 	if opts.Verbose {
 		fmt.Fprintf(os.Stderr, "%s: CoW preflight unavailable (%v); using stock git worktree add\n", commandName, reason)
 	}
+	writeBackendLabel("stock")
 	return execGitWorktreeAdd(opts.GitArgs)
+}
+
+func writeBackendLabel(backend string) {
+	if os.Getenv("SQ_INVOKED_BY_SQ") == "" || backendLabelWritten {
+		return
+	}
+	writeMetricsLabels("backend:" + backend)
+	backendLabelWritten = true
 }
 
 // analysis is everything the clone plan needs that depends only on the

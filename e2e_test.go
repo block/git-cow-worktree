@@ -20,6 +20,158 @@ import (
 // `git worktree add` against equivalent setups, the resulting worktrees'
 // tracked-file contents are byte-identical.
 
+func TestExperimentAssignmentIsStableAndBalanced(t *testing.T) {
+	t.Setenv("SQ_INVOKED_BY_SQ", "1")
+
+	r := newRepo(t, "assignment")
+	r.commit("a.txt", "alpha")
+
+	first, err := assignedCowMode([]string{"--detach", "../target", "HEAD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := assignedCowMode([]string{"--detach", "../target", "HEAD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("assignment changed: %q then %q", first, second)
+	}
+
+	counts := map[cowMode]int{}
+	for i := range 256 {
+		mode, err := assignedCowMode([]string{"--detach", filepath.Join(r.parent, "target-"+itoa(i)), "HEAD"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[mode]++
+	}
+	if counts[cowModeAuto] < 96 || counts[cowModeAuto] > 160 {
+		t.Fatalf("unexpected 50:50 distribution over deterministic keys: %+v", counts)
+	}
+}
+
+func TestMetricsLabelsAreBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SQ_METRICS_PIPE", path)
+	writeMetricsLabels("arm:cow")
+	writeMetricsLabels("result:success")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "LABELS arm:cow\nLABELS result:success\n"; string(got) != want {
+		t.Fatalf("metrics=%q want %q", got, want)
+	}
+}
+
+func TestE2E_SqExperimentWritesAssignedArmAndResult(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "sq-experiment")
+	r.commit("a.txt", "alpha")
+
+	var out string
+	var assigned cowMode
+	for i := range 100 {
+		out = filepath.Join(r.parent, "out-"+itoa(i))
+		var err error
+		assigned, err = assignedCowModeInDir([]string{"--detach", out, "HEAD"}, r.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if assigned == cowModeAuto {
+			break
+		}
+	}
+	if assigned != cowModeAuto {
+		t.Fatal("could not find deterministic CoW assignment")
+	}
+	metrics := filepath.Join(r.parent, "metrics")
+	if err := os.WriteFile(metrics, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "add", "--detach", out, "HEAD")
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "SQ_INVOKED_BY_SQ=1", "SQ_METRICS_PIPE="+metrics)
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sq experiment invocation: %v\n%s", err, got)
+	}
+	got, err := os.ReadFile(metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "LABELS arm:cow\nLABELS backend:cow\nLABELS result:success\n"; string(got) != want {
+		t.Fatalf("metrics=%q want %q", got, want)
+	}
+	assertIndexUpToDate(t, out, "")
+}
+
+func TestE2E_DirectInvocationDoesNotWriteExperimentMetrics(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "direct-no-metrics")
+	r.commit("a.txt", "alpha")
+	out := filepath.Join(r.parent, "out")
+	metrics := filepath.Join(r.parent, "metrics")
+	if err := os.WriteFile(metrics, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "add", "--cow=off", "--detach", out, "HEAD")
+	cmd.Dir = r.dir
+	cmd.Env = append(removeEnv(os.Environ(), "SQ_INVOKED_BY_SQ"), "SQ_METRICS_PIPE="+metrics)
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("direct invocation: %v\n%s", err, got)
+	}
+	got, err := os.ReadFile(metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("direct invocation emitted experiment metrics: %q", got)
+	}
+}
+
+func TestE2E_SqExperimentRejectsCowOverride(t *testing.T) {
+	bin := buildGitCowWorktree(t)
+	r := newRepo(t, "sq-override")
+	r.commit("a.txt", "alpha")
+	out := filepath.Join(r.parent, "out")
+	metrics := filepath.Join(r.parent, "metrics")
+	if err := os.WriteFile(metrics, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "add", "--cow=off", "--detach", out, "HEAD")
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "SQ_INVOKED_BY_SQ=1", "SQ_METRICS_PIPE="+metrics)
+	got, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("sq override succeeded:\n%s", got)
+	}
+	if !strings.Contains(string(got), "--cow is controlled by the beta experiment") {
+		t.Fatalf("unexpected error:\n%s", got)
+	}
+	metricsOut, readErr := os.ReadFile(metrics)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if want := "LABELS backend:unknown\nLABELS result:failure\n"; string(metricsOut) != want {
+		t.Fatalf("metrics=%q want %q", metricsOut, want)
+	}
+}
+
+func removeEnv(env []string, key string) []string {
+	prefix := key + "="
+	out := env[:0]
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
 func TestParseArgsCowMode(t *testing.T) {
 	for _, tc := range []struct {
 		args []string
